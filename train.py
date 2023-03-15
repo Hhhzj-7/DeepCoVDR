@@ -1,5 +1,10 @@
 # encoding: utf-8
 import torch
+from torch.utils import data
+import torch.nn.functional as F
+from torch.autograd import Variable
+from torch import nn
+
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -8,72 +13,21 @@ import gc
 from mpn_models_chemprop.data.data import MoleculeDataset, MoleculeDatapoint
 import numpy as np
 import pandas as pd
-import codecs
 from sklearn.metrics import mean_squared_error
 from lifelines.utils import concordance_index
 from scipy.stats import pearsonr,spearmanr
-from sklearn.metrics import roc_auc_score,precision_recall_curve,accuracy_score
-from sklearn.model_selection import train_test_split
 from sklearn.model_selection import KFold
 
 import copy
 import time
-import pickle
 from argparse import ArgumentParser
-from tqdm import tqdm
 
-import torch.optim as optim
-
-
-
-from torch.utils import data
-import torch.nn.functional as F
-from torch.autograd import Variable
-from torch import nn
-
-from torch.utils.data import SequentialSampler
 
 from subword_nmt.apply_bpe import BPE
 from enceoder import Encoder_MultipleLayers, Embeddings
 from mpn_models_chemprop import MoleculeModel
 
-
-def metrics_graph(yt, yp):
-    precision, recall, _, = precision_recall_curve(yt, yp)
-    aupr = -np.trapz(precision, recall)
-    auc = roc_auc_score(yt, yp)
-    real_score=np.mat(yt)
-    predict_score=np.mat(yp)
-    sorted_predict_score = np.array(sorted(list(set(np.array(predict_score).flatten()))))
-    sorted_predict_score_num = len(sorted_predict_score)
-    thresholds = sorted_predict_score[np.int32(sorted_predict_score_num * np.arange(1, 1000) / 1000)]
-    thresholds = np.mat(thresholds)
-    thresholds_num = thresholds.shape[1]
-    predict_score_matrix = np.tile(predict_score, (thresholds_num, 1))
-    negative_index = np.where(predict_score_matrix < thresholds.T)
-    positive_index = np.where(predict_score_matrix >= thresholds.T)
-    predict_score_matrix[negative_index] = 0
-    predict_score_matrix[positive_index] = 1
-    TP = predict_score_matrix.dot(real_score.T)
-    FP = predict_score_matrix.sum(axis=1) - TP
-    FN = real_score.sum() - TP
-    TN = len(real_score.T) - TP - FP - FN
-    tpr = TP / (TP + FN)
-    recall_list = tpr
-    precision_list = TP / (TP + FP)
-    f1_score_list = 2 * TP / (len(real_score.T) + TP - TN)
-    accuracy_list = (TP + TN) / len(real_score.T)
-    specificity_list = TN / (TN + FP)
-    max_index = np.argmax(f1_score_list)
-    f1_score = f1_score_list[max_index]
-    accuracy = accuracy_list[max_index]
-    specificity = specificity_list[max_index]
-    recall = recall_list[max_index]
-    precision = precision_list[max_index]
-    return auc, aupr, f1_score[0, 0], accuracy[0, 0] #, recall[0, 0], specificity[0, 0], precision[0, 0]
-
-
-
+# dataloader for Cancer dataset
 class data_process_loader(data.Dataset):
 	def __init__(self, list_IDs, labels, drug_df,rna_df):
 		'Initialization'
@@ -95,6 +49,7 @@ class data_process_loader(data.Dataset):
 
 		return v_d, v_p, y
 
+# dataloader for Sars-CoV-2 dataset
 class data_process_loader_covid(data.Dataset):
 	def __init__(self, list_IDs, labels, drug_df):
 		'Initialization'
@@ -115,10 +70,10 @@ class data_process_loader_covid(data.Dataset):
 		return v_d, y
 
 
-
-class transformer(nn.Sequential):
+# transformer for drug feature and cross-attention module
+class Transformer(nn.Sequential):
     def __init__(self, dmpnn_encoder):
-        super(transformer, self).__init__()
+        super(Transformer, self).__init__()
         input_dim_drug = 2586
         transformer_emb_size_drug = 128
         transformer_dropout_rate = 0.1
@@ -128,7 +83,7 @@ class transformer(nn.Sequential):
         transformer_attention_probs_dropout = 0.1
         transformer_hidden_dropout_rate = 0.1
 
-        self.dmpnn_encoder = dmpnn_encoder
+        self.dmpnn_encoder = dmpnn_encoder       # dmpnn
 
         self.emb = Embeddings(input_dim_drug,
                          transformer_emb_size_drug,
@@ -145,8 +100,9 @@ class transformer(nn.Sequential):
 
         self.cell_linear = torch.nn.Linear(384, 128)
 
-    def forward(self, v, v_P, fusion):
-        smile_data = MoleculeDataset([              # datapoint
+    def forward(self, v, v_P, fusion):    # fusion == True, used for cross-attention ; fusion == False, used for graphtransformer
+        # datapoint
+        smile_data = MoleculeDataset([              
             MoleculeDatapoint( 
                 line=line,
             ) for i, line in enumerate(v)
@@ -155,33 +111,38 @@ class transformer(nn.Sequential):
         h_node = self.dmpnn_encoder(smile_data.smiles())[0]
         degree = self.dmpnn_encoder(smile_data.smiles())[1]
         mask = []
+        # Unify dimension
         for i in range(len(h_node)):
             mask.append([] + h_node[i].size()[0] * [0] + (300-h_node[i].size()[0]) * [-10000])
             temp = torch.full([(300-h_node[i].size()[0]), 300], 0).to(device)
             degree_temp = torch.zeros(300-h_node[i].size()[0]).to(device)
             h_node[i] = torch.cat((h_node[i], temp),0)
             degree[i] = torch.cat((torch.Tensor(degree[i]).to(device), degree_temp), 0)
-
-        h_node = torch.stack(h_node) + self.position_embeddings(torch.stack(degree).long())  #position
+        # use degree encoding instead of position encoding
+        h_node = torch.stack(h_node) + self.position_embeddings(torch.stack(degree).long())  
+        # dmpnn
         h_node = self.dmpnn_encoder.ffn(h_node)
 
         mask = torch.tensor(mask, dtype=torch.float)
         mask =  mask.to(device).unsqueeze(1).unsqueeze(2)
-        if fusion:
+        # cross-attention
+        if fusion:        
             encoded_layers = self.encoder([h_node.float(),v_P.unsqueeze(1).expand(h_node.size()[0],300,128).float()], mask, fusion)
             return encoded_layers[:,:, 0]
-        else:
+        # graphtransformer
+        else:            
             encoded_layers = self.encoder(h_node.float(), mask, fusion)
             return encoded_layers[:, 0]
 
-class MLP(nn.Sequential):
+# DNN for cell line feature
+class DNN(nn.Sequential):
     def __init__(self):
+        super(DNN, self).__init__()
         input_dim_gene = 11794
         hidden_dim_gene = 128
-        mlp_hidden_dims_gene = [1024, 512, 256]
-        super(MLP, self).__init__()
-        layer_size = len(mlp_hidden_dims_gene) + 1
-        dims = [input_dim_gene] + mlp_hidden_dims_gene + [hidden_dim_gene]
+        dnn_hidden_dims_gene = [1024, 512, 256]
+        layer_size = len(dnn_hidden_dims_gene) + 1
+        dims = [input_dim_gene] + dnn_hidden_dims_gene + [hidden_dim_gene]
         self.predictor = nn.ModuleList([nn.Linear(dims[i], dims[i + 1]) for i in range(layer_size)])
 
     def forward(self, v):
@@ -190,9 +151,10 @@ class MLP(nn.Sequential):
             v = F.relu(l(v))
         return v
 
-class Classifier(nn.Sequential):
+# fuse representation of drug and cell line, then predict 
+class Predict(nn.Sequential):
     def __init__(self, model_drug, model_gene, model_drug_nol):
-        super(Classifier, self).__init__()
+        super(Predict, self).__init__()
         self.input_dim_drug = 128
         self.input_dim_gene = 0
         self.Dn = model_drug_nol
@@ -204,14 +166,14 @@ class Classifier(nn.Sequential):
         dims = [256] + self.hidden_dims + [1]
         self.predictor = nn.ModuleList([nn.Linear(dims[i], dims[i + 1]) for i in range(layer_size)])
 
-
-
-
-    def forward(self, v_D, v_P, epo,f):
+    def forward(self, v_D, v_P):
+        # first cell line representation 
         v_P = self.model_gene(v_P)
+        # first drug representation 
         v_D_nol = self.Dn(v_D, v_P,False)
+        # output of cross-attention module, including second drug representation and second cell line representation 
         v_D = self.model_drug(v_D, v_P, True)
-        # final
+        # fusion representation
         v_d_f = (v_D[0] + v_D_nol) / 2
         v_p_f = (v_D[1] + v_P) / 2
         v_f = torch.cat((v_d_f, v_p_f), 1)
@@ -224,22 +186,32 @@ class Classifier(nn.Sequential):
 
         return v_f
 
-
+# train and test
 class DeepCoVDR:
     def __init__(self,modeldir, args, best_state=None):
         self.device = torch.device('cuda:0')
+        # dmpnn
         self.dmpnn_encoder = MoleculeModel(classification=False, multiclass=False)
         self.dmpnn_encoder.create_encoder(args)
-        self.dmpnn_encoder.ffn = nn.Sequential(             # used by MoleculeModel
+        self.dmpnn_encoder.ffn = nn.Sequential( 
                 nn.Linear(args.hidden_size, args.hidden_size),
                 nn.ReLU(),
                 nn.Linear(args.hidden_size, args.dmpnn_output_size)
         )
-        model_drug = transformer(self.dmpnn_encoder)
-        model_drug_nol = transformer(self.dmpnn_encoder)
+       
+        # transformer for cross-attention module
+        model_drug = Transformer(self.dmpnn_encoder)
+        
+        # transformer for first drug representation
+        model_drug_nol = Transformer(self.dmpnn_encoder)
         self.model_drug_nol = model_drug
-        model_gene = MLP()
-        self.model = Classifier(model_drug, model_gene, model_drug_nol)
+        
+        # DNN for cell line feature
+        model_gene = DNN()
+
+        # fuse and predict
+        self.model = Predict(model_drug, model_gene, model_drug_nol)
+
         self.modeldir = modeldir
         self.best_state = {}
         self.covid_best_state = {}
@@ -247,15 +219,13 @@ class DeepCoVDR:
             self.load_state = best_state
         else: self.load_state = None
     
-
-
-
-    def test(self,datagenerator,model):
+    # test for Cancer dataset
+    def test(self,datagenerator, model):
         y_label = []
         y_pred = []
         model.eval()
         for i,(v_drug,v_gene,label) in enumerate(datagenerator):
-            score = model(v_drug,v_gene,'','')
+            score = model(v_drug,v_gene)
             loss_fct = torch.nn.MSELoss()
             n = torch.squeeze(score, 1)
             loss = loss_fct(n, Variable(torch.from_numpy(np.array(label)).float()).to(self.device))
@@ -276,6 +246,7 @@ class DeepCoVDR:
                concordance_index(y_label, y_pred), \
                loss, \
 
+    # test for SARS-CoV-2 dataset
     def test_covid(self,datagenerator,model,rna):
         y_label = []
         y_pred = []
@@ -283,7 +254,7 @@ class DeepCoVDR:
         for i,(v_drug,label) in enumerate(datagenerator):
             label1 = Variable(torch.from_numpy(np.array(label))).float().to(self.device)
             v_p = torch.tensor(rna).unsqueeze(0).repeat(label1.size()[0], 1)
-            score = model(v_drug,v_p,'','')
+            score = model(v_drug,v_p)
             loss_fct = torch.nn.MSELoss()
             n = torch.squeeze(score, 1)
             loss = loss_fct(n, Variable(torch.from_numpy(np.array(label)).float()).to(self.device))
@@ -291,6 +262,7 @@ class DeepCoVDR:
             label_ids = label.to('cpu').numpy()
             y_label = y_label + label_ids.flatten().tolist()
             y_pred = y_pred + logits.flatten().tolist()
+        
         model.train()
 
         return y_label, y_pred, \
@@ -304,8 +276,8 @@ class DeepCoVDR:
                loss\
 
 
-
-    def train(self, train_drug, train_rna, val_drug, val_rna):
+    # train for Cancer dataset
+    def train(self, train_drug, train_gene, val_drug, val_rna):
         lr = 1e-4
         decay = 0
         BATCH_SIZE = 32
@@ -322,7 +294,7 @@ class DeepCoVDR:
                   'num_workers': 0,
                   'drop_last': False}
         training_generator = data.DataLoader(data_process_loader(
-            train_drug.index.values, train_drug.Label.values, train_drug, train_rna), **params)  
+            train_drug.index.values, train_drug.Label.values, train_drug, train_gene), **params)  
         validation_generator = data.DataLoader(data_process_loader(
             val_drug.index.values, val_drug.Label.values, val_drug, val_rna), **params)
 
@@ -330,17 +302,14 @@ class DeepCoVDR:
         model_max = copy.deepcopy(self.model)
 
         valid_metric_record = []
-        valid_metric_header = ['# epoch',"MSE", 'RMSE',
-                                    "Pearson Correlation", "with p-value",
-                                    'Spearman Correlation',"with p-value2",
-                                    "Concordance Index"]
+
         float2str = lambda x: '%0.4f' % x
         print('--- Go for Training(cancer) ---')
         t_start = time.time()
         iteration_loss = 0
         for epo in range(train_epoch):
             for i, (v_d, v_p, label) in enumerate(training_generator):
-                score = self.model(v_d, v_p, epo,False)
+                score = self.model(v_d, v_p)
                 label = Variable(torch.from_numpy(np.array(label))).float().to(self.device)
 
                 loss_fct = torch.nn.MSELoss()
@@ -392,12 +361,12 @@ class DeepCoVDR:
 
 
 
-
+    # train for SARS-CoV-2 dataset
     def train_covid(self, train_drug, val_drug, rna, emb_for_vis_pre, emb_for_vis_label):
         lr = 1e-4
         decay = 0
         BATCH_SIZE = 32
-        train_epoch = 15000
+        train_epoch = 12000
         self.model = self.model.to(self.device) 
         opt = torch.optim.Adam(filter(lambda p:p.requires_grad, self.model.parameters()), lr=lr, weight_decay=decay, eps=1e-08)
         if self.load_state != None:
@@ -419,10 +388,7 @@ class DeepCoVDR:
         model_max = copy.deepcopy(self.model)
 
         valid_metric_record = []
-        valid_metric_header = ['# epoch',"MSE", 'RMSE',
-                                    "Pearson Correlation", "with p-value",
-                                    'Spearman Correlation',"with p-value2",
-                                    "Concordance Index"]
+
         float2str = lambda x: '%0.4f' % x
         print('--- Go for Training(sars-covid-2) ---')
         t_start = time.time()
@@ -434,7 +400,7 @@ class DeepCoVDR:
                 label = Variable(torch.from_numpy(np.array(label))).float().to(self.device)
                 v_p = torch.tensor(rna).unsqueeze(0).repeat(label.size()[0], 1)
 
-                score = self.model(v_d, v_p,epo,True)
+                score = self.model(v_d, v_p)
 
                 loss_fct = torch.nn.MSELoss()
                 n = torch.squeeze(score, 1).float()
@@ -446,9 +412,6 @@ class DeepCoVDR:
                 loss.backward()
                 opt.step()
 
-
-
- 
             with torch.set_grad_enabled(False):
 
                 y_true,y_pred, mse, rmse, \
@@ -459,7 +422,6 @@ class DeepCoVDR:
                                                                    s_p_val, CI]))
                 valid_metric_record.append(lst)
 
-                
                 t_now = time.time()
                 if i % 500 == 0:
                     print('Training at Epoch ' + str(epo + 1) +
@@ -490,33 +452,12 @@ class DeepCoVDR:
 
         print('--- Finished 2---')
 
-
-
-
-
-    def predict(self, drug_data, rna_data):
-        print('predicting')
-        self.model.to(device)
-        info = data_process_loader(drug_data.index.values,
-                                   drug_data.Label.values,
-                                   drug_data, rna_data)
-        params = {'batch_size': 16,
-                  'shuffle': False,
-                  'num_workers': 8,
-                  'drop_last': False,
-                  'sampler': SequentialSampler(info)}
-        generator = data.DataLoader(info, **params)
-
-        y_label, y_pred, mse, rmse, person, p_val, spearman, s_p_val, CI, loss_val = \
-            self.test(generator, self.model)
-
-        return y_label, y_pred, mse, rmse, person, p_val, spearman, s_p_val, CI
-
     def save_model(self, num):
         torch.save(self.model, 'save_model/model'+str(num)+'.pt') # path
 
     def load_model(self):
         return self.best_state
+
     def load_covid_model(self):
         return self.covid_best_state
    
@@ -661,54 +602,58 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    from encoding import DataEncoding
-    vocab_dir = 'GDSC_data/GDSC2_fitted_dose_response_25Feb20.xlsx'
-    obj = DataEncoding(vocab_dir=vocab_dir)
 
-    traindata, testdata = obj.Getdata.ByCancer(random_seed=12344)
 
-    traindata, train_rnadata, testdata, test_rnadata = obj.encode(   # traindata:cell line and drug，train_rnadata:cell line and gene expression values
+    from encoding import Data_for_cancer
+
+    # for cancer
+    obj = Data_for_cancer()
+
+    traindata, testdata = obj.Getdata.ByCancer(random_seed=1)
+
+    # Cancer drug and cell line
+    traindata, train_genedata, testdata, test_rnadata = obj.encode( 
         traindata=traindata, 
-        testdata=testdata)
-
+        testdata=testdata
+    )
     modeldir = 'Model'
     modelfile = modeldir + '/model.pt'
     if not os.path.exists(modeldir):
         os.mkdir(modeldir)
 
-
+    # pre-train by cancer
     net = DeepCoVDR(modeldir=modeldir, args=args) 
-    net.train(train_drug=traindata, train_rna=train_rnadata,
+    net.train(train_drug=traindata, train_gene=train_genedata,
               val_drug=testdata, val_rna=test_rnadata)
 
     best_state = net.load_model()
 
 
     # for covid19
-    # drug
+
+    # SARS-CoV-2 drug
     ic50 = pd.read_csv('SarsCov2_data/sars_ic50.tsv', sep='\t')
     sub_df = ic50[['Molecule ChEMBL ID', 'Smiles', 'Standard Value']]
     sub_df['Standard Value'] = (sub_df['Standard Value'] / 1000).apply(np.log)
     print(sub_df['Standard Value'])
  
-    # covid cellline 
+    # SARS-CoV-2 cell line 
     cell_line = pd.read_excel('SarsCov2_data/Vero6.xlsx')
     rnadata =  pd.read_csv('GDSC_data/Cell_line_RMA_proc_basalExp.txt',sep='\t')
     gene2value = dict(zip(cell_line['Gene'],cell_line['use']))
     gene_name = [x for x in list(cell_line['Gene']) if x in list(rnadata['GENE_SYMBOLS']) and gene2value[x] != 0]
     record_name = [x for x in cell_line['Gene'] if x in gene_name]
-
     cell_line = cell_line[cell_line['Gene'].isin(gene_name)] 
     cell_line.sort_values(by=['Gene'],ascending=False, inplace=True)
     cell_line['use'] = (cell_line['use'] - cell_line['use'].mean()) / cell_line['use'].std()
     cell_line_list = cell_line['use'].tolist()
 
 
+    # 5-fold on SARS-CoV-2 dataset
     kf = KFold(n_splits=5, random_state=5, shuffle=True)
     foldnum = 0 
     emb_for_vis_pre = []
     emb_for_vis_label = []
-
     for X_train,X_test in kf.split(sub_df):
         foldnum += 1
         new_model = DeepCoVDR(best_state=best_state,modeldir='', args=args)

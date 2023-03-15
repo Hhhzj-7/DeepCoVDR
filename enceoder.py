@@ -12,10 +12,8 @@ import copy
 import math
 import collections
 
-torch.manual_seed(12334)
-np.random.seed(12334)
 
-
+# Layer Normalization
 class LayerNorm(nn.Module):
     def __init__(self, hidden_size, variance_epsilon=1e-12):
 
@@ -30,10 +28,8 @@ class LayerNorm(nn.Module):
         x = (x - u) / torch.sqrt(s + self.variance_epsilon)
         return self.gamma * x + self.beta
 
-
+# word embedding and position encoding
 class Embeddings(nn.Module):
-    """Construct the embeddings from protein/target, position embeddings.
-    """
     def __init__(self, vocab_size, hidden_size, max_position_size, dropout_rate):
         super(Embeddings, self).__init__()
         self.word_embeddings = nn.Embedding(vocab_size, hidden_size)
@@ -55,15 +51,11 @@ class Embeddings(nn.Module):
         embeddings = self.dropout(embeddings)
         return embeddings
     
-
+# self attention
 class SelfAttention(nn.Module):
     def __init__(self, hidden_size, num_attention_heads, attention_probs_dropout_prob):
         super(SelfAttention, self).__init__()
-        if hidden_size % num_attention_heads != 0:
-            raise ValueError(
-                "The hidden size (%d) is not a multiple of the number of attention "
-                "heads (%d)" % (hidden_size, num_attention_heads))
-        self.num_attention_heads = num_attention_heads
+        self.num_attention_heads = num_attention_heads    # multi-heads
         self.attention_head_size = int(hidden_size / num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
@@ -82,7 +74,8 @@ class SelfAttention(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
-    def forward(self, hidden_states, attention_mask,fusion):
+    def forward(self, hidden_states, attention_mask, fusion):
+        # for cross-attention module
         if fusion:
             mixed_query_layer = self.query(hidden_states[0])
             mixed_key_layer = self.key(hidden_states[0])
@@ -129,6 +122,7 @@ class SelfAttention(nn.Module):
             context_layer1 = context_layer.view(*new_context_layer_shape1)
 
             context_layer = torch.cat((context_layer.unsqueeze(0), context_layer1.unsqueeze(0)),0)
+        # for graphtransformer
         else:
             mixed_query_layer = self.query(hidden_states)
             mixed_key_layer = self.key(hidden_states)
@@ -154,7 +148,7 @@ class SelfAttention(nn.Module):
             
         return context_layer
     
-
+# output of self-attention
 class SelfOutput(nn.Module):
     def __init__(self, hidden_size, hidden_dropout_prob):
         super(SelfOutput, self).__init__()
@@ -168,7 +162,7 @@ class SelfOutput(nn.Module):
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states    
     
-    
+# attention layer  
 class Attention(nn.Module):
     def __init__(self, hidden_size, num_attention_heads, attention_probs_dropout_prob, hidden_dropout_prob):
         super(Attention, self).__init__()
@@ -182,6 +176,7 @@ class Attention(nn.Module):
         attention_output = self.output(self_output, input_tensor)
         return attention_output    
     
+# after attention    
 class Intermediate(nn.Module):
     def __init__(self, hidden_size, intermediate_size):
         super(Intermediate, self).__init__()
@@ -191,7 +186,7 @@ class Intermediate(nn.Module):
         hidden_states = self.dense(hidden_states)
         hidden_states = F.relu(hidden_states)
         return hidden_states
-
+# output
 class Output(nn.Module):
     def __init__(self, intermediate_size, hidden_size, hidden_dropout_prob):
         super(Output, self).__init__()
@@ -205,6 +200,7 @@ class Output(nn.Module):
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
+# Transformer encoder
 class Encoder(nn.Module):
     def __init__(self, hidden_size, intermediate_size, num_attention_heads, attention_probs_dropout_prob, hidden_dropout_prob):
         super(Encoder, self).__init__()
@@ -219,7 +215,7 @@ class Encoder(nn.Module):
         layer_output = self.output(intermediate_output, attention_output)
         return layer_output    
 
-    
+# multi-heads transformer encoder
 class Encoder_MultipleLayers(nn.Module):
     def __init__(self, n_layer, hidden_size, intermediate_size,
                  num_attention_heads, attention_probs_dropout_prob, hidden_dropout_prob):
@@ -229,7 +225,6 @@ class Encoder_MultipleLayers(nn.Module):
         self.layer = nn.ModuleList([copy.deepcopy(layer) for _ in range(n_layer)])
 
     def forward(self, hidden_states, attention_mask, fusion,output_all_encoded_layers=True):
-        all_encoder_layers = []
         for layer_module in self.layer:
             hidden_states = layer_module(hidden_states, attention_mask, fusion)
         return hidden_states
